@@ -49,6 +49,10 @@ input,select{font:inherit;font-size:16px;color:var(--ink)}
 .stackbar{display:flex;height:8px;border-radius:99px;overflow:hidden;background:var(--chip);margin-top:14px}
 .stackbar i{display:block;height:100%}
 
+.sortbar{display:flex;align-items:center;justify-content:space-between;margin:2px 4px 10px;font-size:13px;color:var(--sub)}
+.seg{display:flex;background:var(--chip);border-radius:10px;padding:3px}
+.seg button{padding:5px 12px;border-radius:8px;font-size:13px;color:var(--sub)}
+.seg button.on{background:var(--card);color:var(--ink);font-weight:600;box-shadow:0 1px 3px rgba(0,0,0,.08)}
 .banner{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:12px 14px;margin-bottom:12px;font-size:14px}
 .banner button{color:var(--accent);font-weight:600;white-space:nowrap}
 
@@ -149,6 +153,16 @@ tr+tr td{border-top:1px solid var(--line)}
 .auth .card{padding:18px;margin-bottom:12px}
 .auth h2{font-size:16px;margin:0 0 12px}
 .err{color:var(--danger);font-size:13px;min-height:18px;margin:4px 0}
+.choices{display:flex;flex-direction:column;gap:10px}
+.choice{display:flex;align-items:center;gap:12px;width:100%;text-align:left;padding:18px;border-radius:var(--r);background:var(--card);border:1px solid var(--line);box-shadow:var(--shadow)}
+.choice span{flex:1}
+.choice b{display:block;font-size:17px;margin-bottom:2px}
+.choice small{color:var(--sub);font-size:13px}
+.choice svg{color:var(--sub);flex:none}
+.choice:active{transform:scale(.99);background:var(--chip)}
+.back{display:inline-flex;align-items:center;gap:2px;color:var(--sub);font-size:14px;margin:0 0 18px -6px;padding:6px}
+.divider{display:flex;align-items:center;gap:10px;color:var(--sub);font-size:12px;margin:26px 0 12px}
+.divider::before,.divider::after{content:"";flex:1;height:1px;background:var(--line)}
 
 .toast{position:fixed;left:50%;bottom:calc(150px + env(safe-area-inset-bottom));transform:translateX(-50%) translateY(10px);background:var(--ink);color:var(--bg);
   padding:10px 16px;border-radius:12px;font-size:14px;opacity:0;transition:.2s;z-index:40;pointer-events:none;max-width:88vw;text-align:center}
@@ -286,7 +300,7 @@ function makeCloudStore(sb, hid) {
 }
 
 /* ───────── 상태 ───────── */
-const S = { store: null, sb: null, user: null, month: ym(new Date()), tab: 'month', cats: [], range: [], entries: [], hh: null, members: [], open: new Set() };
+const S = { store: null, sb: null, user: null, month: ym(new Date()), tab: 'month', cats: [], range: [], entries: [], hh: null, members: [], open: new Set(), sort: (() => { try { return localStorage.getItem('fb-sort') || 'date'; } catch (_) { return 'date'; } })() };
 
 /* ───────── 부팅 / 로그인 ───────── */
 async function boot() {
@@ -311,60 +325,115 @@ async function afterLogin(user) {
   start();
 }
 
-function renderAuth() {
-  $('#app').innerHTML = `
-  <div class="auth">
-    <h1>우리집 가계부</h1>
-    <p>둘이 같은 가계부를 함께 써요. 각자 계정으로 로그인하세요.</p>
-    <div class="card">
-      <div class="field"><label>이메일</label><input class="inp" id="em" type="email" autocomplete="email" inputmode="email"></div>
-      <div class="field"><label>비밀번호 (6자 이상)</label><input class="inp" id="pw" type="password" autocomplete="current-password"></div>
-      <div class="err" id="err"></div>
-      <div class="actions"><button class="btn" id="signup">회원가입</button><button class="btn primary" id="signin">로그인</button></div>
-    </div>
+const korErr = m => {
+  const s = String(m || '');
+  if (/Invalid login credentials/i.test(s)) return '이메일 또는 비밀번호가 맞지 않아요.';
+  if (/already registered|already been registered/i.test(s)) return '이미 가입된 이메일이에요. 처음 화면에서 로그인을 눌러주세요.';
+  if (/Email not confirmed/i.test(s)) return '메일 인증이 아직 안 됐어요. 받은 메일의 링크를 눌러주세요.';
+  if (/Password should be/i.test(s)) return '비밀번호는 6자 이상이어야 해요.';
+  if (/invalid.*email|Unable to validate email/i.test(s)) return '이메일 형식을 확인해주세요.';
+  return s;
+};
+function authShell(inner) { $('#app').innerHTML = `<div class="auth">${inner}</div>`; window.scrollTo(0, 0); }
+const bindNav = fn => document.querySelectorAll('[data-nav]').forEach(b => { b.onclick = () => fn(b.dataset.nav); });
+const choiceButtons = `
+  <div class="choices">
+    <button class="choice" data-nav="create"><span><b>새 가계부 만들기</b><small>처음 시작하는 사람 · 만든 뒤 초대코드를 상대에게 보내요</small></span>${ICON.right}</button>
+    <button class="choice" data-nav="join"><span><b>초대코드로 참여하기</b><small>상대에게 초대코드를 받은 사람</small></span>${ICON.right}</button>
   </div>`;
-  const go = async (kind) => {
+
+// 로그인 전: 처음 화면 → 로그인 / 새로 만들기 / 초대코드로 참여
+function renderAuth(mode = 'home') {
+  if (mode === 'home') {
+    authShell(`
+      <h1>우리집 가계부</h1>
+      <p>둘이 같은 가계부를 함께 써요. 어떻게 시작할까요?</p>
+      ${choiceButtons}
+      <div class="divider"><span>이미 계정이 있다면</span></div>
+      <button class="btn" style="width:100%" data-nav="login">로그인</button>`);
+    return bindNav(m => renderAuth(m));
+  }
+  const isLogin = mode === 'login', isJoin = mode === 'join';
+  authShell(`
+    <button class="back" data-nav="home">${ICON.left}처음으로</button>
+    <h1>${isLogin ? '로그인' : isJoin ? '초대코드로 참여' : '새 가계부 만들기'}</h1>
+    <p>${isLogin ? '가입한 이메일과 비밀번호를 입력하세요.'
+      : isJoin ? '받은 초대코드를 넣고 내 계정을 만들면 같은 가계부에 들어가요.'
+      : '계정을 만들면 가계부가 함께 생겨요. 초대코드는 설정 탭에서 확인할 수 있어요.'}</p>
+    <div class="card">
+      ${isJoin ? `<div class="field"><label>초대코드</label><input class="inp code" id="code" autocapitalize="characters" autocomplete="off" placeholder="ABC123"></div>` : ''}
+      ${mode === 'create' ? `<div class="field"><label>가계부 이름</label><input class="inp" id="hn" value="우리집"></div>` : ''}
+      ${isLogin ? '' : `<div class="field"><label>내 이름 · 내역에 표시돼요</label><input class="inp" id="dn" placeholder="${isJoin ? '예: 아내' : '예: 남편'}"></div>`}
+      <div class="field"><label>이메일</label><input class="inp" id="em" type="email" autocomplete="email" inputmode="email"></div>
+      <div class="field"><label>비밀번호${isLogin ? '' : ' (6자 이상)'}</label><input class="inp" id="pw" type="password" autocomplete="${isLogin ? 'current-password' : 'new-password'}"></div>
+      <div class="err" id="err"></div>
+      <button class="btn primary" style="width:100%" id="go">${isLogin ? '로그인' : isJoin ? '가입하고 참여하기' : '가입하고 만들기'}</button>
+    </div>`);
+  bindNav(m => renderAuth(m));
+  const err = m => { $('#err').textContent = m; };
+  $('#go').onclick = async ev => {
     const email = $('#em').value.trim(), password = $('#pw').value;
-    $('#err').textContent = '';
-    if (!email || password.length < 6) { $('#err').textContent = '이메일과 6자 이상 비밀번호를 입력하세요.'; return; }
-    const fn = kind === 'up' ? S.sb.auth.signUp({ email, password }) : S.sb.auth.signInWithPassword({ email, password });
-    const { data, error } = await fn;
-    if (error) { $('#err').textContent = error.message; return; }
-    if (!data.session) { $('#err').textContent = '가입 확인 메일을 보냈어요. 메일의 링크를 누른 뒤 로그인하세요.'; return; }
-    afterLogin(data.session.user).catch(e => { $('#err').textContent = e.message; });
+    const code = $('#code')?.value.trim().toUpperCase(), name = $('#dn')?.value.trim(), hn = $('#hn')?.value.trim();
+    err('');
+    if (isJoin && !code) return err('초대코드를 입력하세요.');
+    if (!isLogin && !name) return err('내 이름을 입력하세요.');
+    if (!email || password.length < 6) return err('이메일과 6자 이상 비밀번호를 입력하세요.');
+    ev.target.disabled = true;
+    try {
+      if (isLogin) {
+        const { data, error } = await S.sb.auth.signInWithPassword({ email, password });
+        if (error) throw error;
+        return await afterLogin(data.session.user);
+      }
+      const { data, error } = await S.sb.auth.signUp({ email, password });
+      if (error) throw error;
+      if (!data.session) { ev.target.disabled = false; return err('가입 확인 메일을 보냈어요. 메일의 링크를 누른 뒤 로그인하세요.'); }
+      S.user = data.session.user;
+      const { error: e2 } = isJoin
+        ? await S.sb.rpc('join_household', { p_code: code, p_display: name })
+        : await S.sb.rpc('create_household', { p_name: hn || '우리집', p_display: name });
+      // 가입은 됐는데 코드가 틀린 경우 → 로그인 상태로 다시 입력받기
+      if (e2) return renderOnboard(isJoin ? 'join' : 'create', { err: e2.message, code, name });
+      await afterLogin(S.user);
+    } catch (e) { ev.target.disabled = false; err(korErr(e.message)); }
   };
-  $('#signin').onclick = () => go('in');
-  $('#signup').onclick = () => go('up');
 }
 
-function renderOnboard() {
-  $('#app').innerHTML = `
-  <div class="auth">
-    <h1>가계부 연결</h1>
-    <p>한 명이 새로 만들고, 다른 한 명은 초대코드로 참여하면 돼요.</p>
+// 로그인은 했지만 아직 가계부가 없을 때
+function renderOnboard(mode = 'home', o = {}) {
+  if (mode === 'home') {
+    authShell(`
+      <h1>가계부 연결</h1>
+      <p>${esc(S.user?.email || '')} 계정에 연결된 가계부가 없어요.</p>
+      ${choiceButtons}
+      <p style="text-align:center;margin-top:20px"><button class="link" id="out">다른 계정으로 로그인</button></p>`);
+    bindNav(m => renderOnboard(m));
+    $('#out').onclick = async () => { await S.sb.auth.signOut(); renderAuth(); };
+    return;
+  }
+  const isJoin = mode === 'join';
+  authShell(`
+    <button class="back" data-nav="home">${ICON.left}뒤로</button>
+    <h1>${isJoin ? '초대코드로 참여' : '새 가계부 만들기'}</h1>
+    <p>${isJoin ? '받은 초대코드를 입력하세요.' : '가계부 이름과 내 이름을 정하세요.'}</p>
     <div class="card">
-      <h2>새 가계부 만들기</h2>
-      <div class="field"><label>가계부 이름</label><input class="inp" id="hn" value="우리집"></div>
-      <div class="field"><label>내 이름</label><input class="inp" id="dn1" placeholder="예: 남편"></div>
-      <button class="btn primary" style="width:100%" id="create">만들기</button>
-    </div>
-    <div class="card">
-      <h2>초대코드로 참여</h2>
-      <div class="field"><label>초대코드</label><input class="inp code" id="code" autocapitalize="characters" placeholder="ABC123"></div>
-      <div class="field"><label>내 이름</label><input class="inp" id="dn2" placeholder="예: 아내"></div>
-      <button class="btn" style="width:100%" id="join">참여하기</button>
-    </div>
-    <div class="err" id="err"></div>
-    <p style="text-align:center"><button class="link" id="out">다른 계정으로 로그인</button></p>
-  </div>`;
-  const run = async (rpc, args) => {
-    const { error } = await S.sb.rpc(rpc, args);
-    if (error) { $('#err').textContent = error.message; return; }
+      ${isJoin ? `<div class="field"><label>초대코드</label><input class="inp code" id="code" autocapitalize="characters" autocomplete="off" placeholder="ABC123" value="${esc(o.code || '')}"></div>`
+               : `<div class="field"><label>가계부 이름</label><input class="inp" id="hn" value="우리집"></div>`}
+      <div class="field"><label>내 이름 · 내역에 표시돼요</label><input class="inp" id="dn" value="${esc(o.name || '')}" placeholder="${isJoin ? '예: 아내' : '예: 남편'}"></div>
+      <div class="err" id="err">${esc(o.err || '')}</div>
+      <button class="btn primary" style="width:100%" id="go">${isJoin ? '참여하기' : '만들기'}</button>
+    </div>`);
+  bindNav(m => renderOnboard(m));
+  $('#go').onclick = async ev => {
+    const name = $('#dn').value.trim();
+    if (!name) { $('#err').textContent = '내 이름을 입력하세요.'; return; }
+    ev.target.disabled = true;
+    const { error } = isJoin
+      ? await S.sb.rpc('join_household', { p_code: $('#code').value.trim().toUpperCase(), p_display: name })
+      : await S.sb.rpc('create_household', { p_name: $('#hn').value.trim() || '우리집', p_display: name });
+    if (error) { ev.target.disabled = false; $('#err').textContent = error.message; return; }
     afterLogin(S.user);
   };
-  $('#create').onclick = () => run('create_household', { p_name: $('#hn').value.trim() || '우리집', p_display: $('#dn1').value.trim() || '나' });
-  $('#join').onclick = () => run('join_household', { p_code: $('#code').value.trim().toUpperCase(), p_display: $('#dn2').value.trim() || '나' });
-  $('#out').onclick = async () => { await S.sb.auth.signOut(); renderAuth(); };
 }
 
 /* ───────── 데이터 캐시 ─────────
@@ -452,11 +521,25 @@ function render() {
   </div></nav>`;
 }
 
+const memberName = uid => {
+  if (!uid) return '';
+  const m = S.members.find(x => x.user_id === uid);
+  if (!m && !memberName.asked) { memberName.asked = true; S.store.members().then(list => { S.members = list; render(); }).catch(() => {}); }
+  return m?.display_name || '';
+};
+const rowSub = e => {
+  const bits = [e.spent_on ? `${+e.spent_on.slice(5, 7)}/${+e.spent_on.slice(8, 10)}` : '', memberName(e.created_by)].filter(Boolean);
+  return bits.length ? `<small>${bits.map(esc).join(' · ')}</small>` : '';
+};
+
 function viewMonth() {
   const total = sum(S.entries);
   const prev = sum(S.range.filter(e => e.month === addMonth(S.month, -1)));
   const diff = total - prev;
   const byCat = id => S.entries.filter(e => e.category_id === id);
+  // 날짜 최신순 → 같은 날은 늦게 입력한 것 먼저, 날짜 없는 항목은 맨 아래
+  const byDate = list => [...list].sort((a, b) => (b.spent_on || '').localeCompare(a.spent_on || '') || String(b.created_at || '').localeCompare(String(a.created_at || '')));
+  const sortList = list => S.sort === 'amount' ? byDate(list).sort((a, b) => b.amount - a.amount) : byDate(list);
   const fixedIds = new Set(S.cats.filter(c => c.is_fixed).map(c => c.id));
   const prevFixed = S.range.filter(e => e.month === addMonth(S.month, -1) && fixedIds.has(e.category_id));
   const curFixed = S.entries.filter(e => fixedIds.has(e.category_id));
@@ -469,9 +552,13 @@ function viewMonth() {
     <div class="delta">${prev ? `지난달보다 <span class="${diff > 0 ? 'up' : 'down'} num">${diff > 0 ? '+' : diff < 0 ? '−' : ''}${won(Math.abs(diff))}</span>` : '지난달 기록 없음'}</div>
     ${total ? `<div class="stackbar">${S.cats.map(c => { const v = sum(byCat(c.id)); return v ? `<i style="width:${(v / total) * 100}%;background:${c.color}"></i>` : ''; }).join('')}</div>` : ''}
   </div>
+  <div class="sortbar"><span>내역 정렬</span><div class="seg">
+    <button class="${S.sort === 'date' ? 'on' : ''}" data-act="sort" data-v="date">날짜순</button>
+    <button class="${S.sort === 'amount' ? 'on' : ''}" data-act="sort" data-v="amount">금액순</button>
+  </div></div>
   ${showCopy ? `<div class="card banner"><span>지난달 고정지출 ${prevFixed.length}건 (${won(sum(prevFixed))})</span><button data-act="copyfixed">그대로 불러오기</button></div>` : ''}
   ${S.cats.map(c => {
-    const list = byCat(c.id), v = sum(list), open = S.open.has(c.id);
+    const list = sortList(byCat(c.id)), v = sum(list), open = S.open.has(c.id);
     return `
     <div class="card cat ${open ? 'open' : ''}">
       <button class="cat-head" data-act="toggle" data-id="${c.id}">
@@ -482,7 +569,7 @@ function viewMonth() {
       ${open ? `<div class="cat-body">
         ${list.length ? list.map(e => `
           <button class="row" data-act="edit" data-id="${e.id}">
-            <span class="m"><div>${esc(e.memo || c.name)}</div>${e.spent_on ? `<small>${+e.spent_on.slice(5, 7)}/${+e.spent_on.slice(8, 10)}</small>` : ''}</span>
+            <span class="m"><div>${esc(e.memo || c.name)}</div>${rowSub(e)}</span>
             <span class="num">${won(e.amount)}</span>
           </button>`).join('') : `<div class="empty">아직 기록이 없어요</div>`}
         <button class="add-in" data-act="add" data-cat="${c.id}">+ ${esc(c.name)} 추가</button>
@@ -672,6 +759,7 @@ const ACT = {
   },
   prev: async () => { S.month = addMonth(S.month, -1); S.open.clear(); await refresh(); },
   next: async () => { S.month = addMonth(S.month, 1); S.open.clear(); await refresh(); },
+  sort: b => { S.sort = b.dataset.v; try { localStorage.setItem('fb-sort', S.sort); } catch (_) {} render(); },
   toggle: b => { const id = b.dataset.id; S.open.has(id) ? S.open.delete(id) : S.open.add(id); render(); },
   add: b => entrySheet(null, b.dataset.cat),
   edit: b => entrySheet(S.entries.find(e => e.id === b.dataset.id)),
