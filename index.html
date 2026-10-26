@@ -98,6 +98,7 @@ tr+tr td{border-top:1px solid var(--line)}
 .srow+.srow{border-top:1px solid var(--line)}
 .srow .grow{flex:1;min-width:0}
 .srow .val{color:var(--sub);font-size:14px}
+.srow>svg{color:var(--sub);flex:none;margin-right:-4px}
 .code{font-family:ui-monospace,Menlo,monospace;font-weight:700;letter-spacing:.12em;font-size:18px}
 .mini{width:30px;height:30px;border-radius:8px;display:grid;place-items:center;color:var(--sub)}
 .mini:active{background:var(--chip)}
@@ -285,6 +286,8 @@ function makeCloudStore(sb, hid) {
     async updateEntry(id, p) { return ok(await sb.from('entries').update(p).eq('id', id).select().single()); },
     async deleteEntry(id) { ok(await sb.from('entries').delete().eq('id', id)); },
     async renameHousehold(name) { ok(await sb.from('households').update({ name }).eq('id', hid)); },
+    async updateMyName(name) { ok(await sb.rpc('update_my_name', { p_household: hid, p_name: name })); },
+    async updatePassword(password) { const { error } = await sb.auth.updateUser({ password }); if (error) throw error; },
     // 바뀐 행만 받아서 반영 (전체 재조회 X). DELETE는 필터를 걸 수 없어 id로만 처리해요.
     subscribe(cb) {
       const f = { schema: 'public', filter: `household_id=eq.${hid}` };
@@ -532,6 +535,45 @@ const rowSub = e => {
   return bits.length ? `<small>${bits.map(esc).join(' · ')}</small>` : '';
 };
 
+const myName = () => S.members.find(m => m.user_id === S.user?.id)?.display_name || '';
+const sqlHint = e => /update_my_name|PGRST202|Could not find the function/i.test(e?.message || '') ? 'Supabase에서 migrations/002_profile.sql을 먼저 실행해주세요' : (e?.message || '저장 실패');
+
+function nameSheet() {
+  openSheet(`
+    <h3>내 이름</h3>
+    <div class="field"><input class="inp" id="nm" maxlength="20" value="${esc(myName())}" placeholder="예: 남편"></div>
+    <p class="note" style="margin:-4px 0 14px">이전에 입력한 내역에도 바뀐 이름으로 표시돼요.</p>
+    <div class="actions"><button class="btn primary" id="save">저장</button></div>`, sh => {
+    const nm = sh.querySelector('#nm'); setTimeout(() => nm.focus(), 250);
+    sh.querySelector('#save').onclick = async ev => {
+      const name = nm.value.trim(); if (!name) { toast('이름을 입력하세요'); return; }
+      ev.target.disabled = true;
+      try {
+        await S.store.updateMyName(name);
+        S.members = S.members.map(m => m.user_id === S.user.id ? { ...m, display_name: name } : m);
+        closeSheet(); render(); toast('이름을 바꿨어요');
+      } catch (e) { ev.target.disabled = false; toast(sqlHint(e)); }
+    };
+  });
+}
+
+function passwordSheet() {
+  openSheet(`
+    <h3>비밀번호 변경</h3>
+    <div class="field"><label>새 비밀번호 (6자 이상)</label><input class="inp" id="p1" type="password" autocomplete="new-password"></div>
+    <div class="field"><label>새 비밀번호 확인</label><input class="inp" id="p2" type="password" autocomplete="new-password"></div>
+    <div class="actions"><button class="btn primary" id="save">변경</button></div>`, sh => {
+    sh.querySelector('#save').onclick = async ev => {
+      const p1 = sh.querySelector('#p1').value, p2 = sh.querySelector('#p2').value;
+      if (p1.length < 6) { toast('6자 이상 입력하세요'); return; }
+      if (p1 !== p2) { toast('두 비밀번호가 달라요'); return; }
+      ev.target.disabled = true;
+      try { await S.store.updatePassword(p1); closeSheet(); toast('비밀번호를 바꿨어요'); }
+      catch (e) { ev.target.disabled = false; toast(korErr(e.message)); }
+    };
+  });
+}
+
 function viewMonth() {
   const total = sum(S.entries);
   const prev = sum(S.range.filter(e => e.month === addMonth(S.month, -1)));
@@ -618,6 +660,14 @@ function viewSettings() {
   ${demo ? `<div class="card" style="padding:14px 16px;font-size:14px">
     지금은 <b>데모 모드</b>라 이 기기에만 저장돼요. <code>config.js</code>에 Supabase 주소와 키를 넣으면 둘이 공유하는 모드로 바뀌어요.
   </div>` : ''}
+  ${demo ? '' : `
+  <div class="sec">내 프로필</div>
+  <div class="card">
+    <button class="srow" data-act="editname"><span class="grow">이름<div class="note" style="margin:2px 0 0;padding:0">내역에 입력한 사람으로 표시돼요</div></span><span class="val">${esc(myName() || '설정 안 됨')}</span>${ICON.right}</button>
+    <div class="srow"><span class="grow">이메일</span><span class="val">${esc(S.user?.email || '')}</span></div>
+    <button class="srow" data-act="password"><span class="grow">비밀번호 변경</span>${ICON.right}</button>
+    <button class="srow danger" data-act="logout"><span class="grow">로그아웃</span></button>
+  </div>`}
   <div class="sec">가계부</div>
   <div class="card">
     <button class="srow" data-act="rename"><span class="grow">이름</span><span class="val">${esc(S.hh?.name)}</span></button>
@@ -643,7 +693,7 @@ function viewSettings() {
   <div class="card">
     <button class="srow" data-act="csv"><span class="grow">전체 내역 CSV로 내보내기</span></button>
     ${demo ? `<button class="srow danger" data-act="reset"><span class="grow">데모 데이터 초기화</span></button>`
-           : `<button class="srow danger" data-act="logout"><span class="grow">로그아웃</span><span class="val">${esc(S.user?.email)}</span></button>`}
+           : ''}
   </div>`;
 }
 
@@ -751,6 +801,8 @@ function catSheet(c) {
 
 /* ───────── 액션 ───────── */
 const ACT = {
+  editname: () => nameSheet(),
+  password: () => passwordSheet(),
   tab: async b => {
     S.tab = b.dataset.v; window.scrollTo(0, 0);
     if (S.tab === 'trend') return refresh(); // 추이 탭을 열 때만 6개월치 합계용 데이터 로드
