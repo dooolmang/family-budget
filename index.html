@@ -236,9 +236,10 @@ function makeLocalStore() {
     async addCategory(c) { const n = { id: uid(), sort_order: Math.max(-1, ...db.categories.map(x => x.sort_order)) + 1, ...c }; db.categories.push(n); save(); return n; },
     async updateCategory(id, p) { Object.assign(db.categories.find(c => c.id === id) || {}, p); save(); },
     async deleteCategory(id) { db.categories = db.categories.filter(c => c.id !== id); db.entries = db.entries.filter(e => e.category_id !== id); save(); },
-    async entries(from, to) { return db.entries.filter(e => e.month >= from && e.month <= to); },
-    async addEntry(e) { const n = { id: uid(), created_at: new Date().toISOString(), ...e }; db.entries.push(n); save(); return n; },
-    async updateEntry(id, p) { Object.assign(db.entries.find(e => e.id === id) || {}, p); save(); },
+    async entries(from, to) { return db.entries.filter(e => e.month >= from && e.month <= to).map(e => ({ ...e })); },
+    async addEntry(e) { const n = { id: uid(), created_at: new Date().toISOString(), ...e }; db.entries.push(n); save(); return { ...n }; },
+    async addEntries(list) { const out = []; for (const e of list) out.push(await this.addEntry(e)); return out; },
+    async updateEntry(id, p) { const e = db.entries.find(x => x.id === id); Object.assign(e || {}, p); save(); return e && { ...e }; },
     async deleteEntry(id) { db.entries = db.entries.filter(e => e.id !== id); save(); },
     async renameHousehold(name) { db.household.name = name; save(); },
     subscribe() { return () => {}; },
@@ -260,15 +261,23 @@ function makeCloudStore(sb, hid) {
     },
     async updateCategory(id, p) { ok(await sb.from('categories').update(p).eq('id', id)); },
     async deleteCategory(id) { ok(await sb.from('categories').delete().eq('id', id)); },
-    async entries(from, to) { return ok(await sb.from('entries').select('*').eq('household_id', hid).gte('month', from).lte('month', to).order('created_at')); },
+    // light=true → 합계 계산에 필요한 컬럼만 받아서 전송량을 줄여요
+    async entries(from, to, light = false) {
+      return ok(await sb.from('entries').select(light ? 'id,month,category_id,amount,created_at' : '*')
+        .eq('household_id', hid).gte('month', from).lte('month', to).order('created_at'));
+    },
     async addEntry(e) { return ok(await sb.from('entries').insert({ ...e, household_id: hid }).select().single()); },
-    async updateEntry(id, p) { ok(await sb.from('entries').update(p).eq('id', id)); },
+    async addEntries(list) { return ok(await sb.from('entries').insert(list.map(e => ({ ...e, household_id: hid }))).select()); },
+    async updateEntry(id, p) { return ok(await sb.from('entries').update(p).eq('id', id).select().single()); },
     async deleteEntry(id) { ok(await sb.from('entries').delete().eq('id', id)); },
     async renameHousehold(name) { ok(await sb.from('households').update({ name }).eq('id', hid)); },
+    // 바뀐 행만 받아서 반영 (전체 재조회 X). DELETE는 필터를 걸 수 없어 id로만 처리해요.
     subscribe(cb) {
       const f = { schema: 'public', filter: `household_id=eq.${hid}` };
       const ch = sb.channel('hh-' + hid)
-        .on('postgres_changes', { event: '*', table: 'entries', ...f }, cb)
+        .on('postgres_changes', { event: 'INSERT', table: 'entries', ...f }, cb)
+        .on('postgres_changes', { event: 'UPDATE', table: 'entries', ...f }, cb)
+        .on('postgres_changes', { event: 'DELETE', table: 'entries', schema: 'public' }, cb)
         .on('postgres_changes', { event: '*', table: 'categories', ...f }, cb)
         .subscribe();
       return () => sb.removeChannel(ch);
@@ -358,23 +367,66 @@ function renderOnboard() {
   $('#out').onclick = async () => { await S.sb.auth.signOut(); renderAuth(); };
 }
 
-/* ───────── 데이터 로드 ───────── */
-async function load() {
-  const from = addMonth(S.month, -5);
-  const [cats, range, hh, members] = await Promise.all([
-    S.store.categories(), S.store.entries(from, S.month), S.store.household(), S.store.members(),
-  ]);
-  S.cats = cats; S.range = range; S.hh = hh; S.members = members;
-  S.entries = range.filter(e => e.month === S.month);
-}
-async function refresh() { try { await load(); render(); } catch (e) { toast(e.message || '불러오기 실패'); } }
+/* ───────── 데이터 캐시 ─────────
+   한 번 받은 달은 메모리에 두고 재사용해요.
+   state: 'full' = 메모까지 전부, 'light' = 합계용 컬럼만 */
+const C = { rows: new Map(), state: new Map() };
+const last6 = () => Array.from({ length: 6 }, (_, i) => addMonth(S.month, i - 5));
+const rowsOf = m => [...C.rows.values()].filter(r => r.month === m).sort((a, b) => String(a.created_at || '').localeCompare(String(b.created_at || '')));
 
-let unsub = null, rt;
+async function ensure(months, level) {
+  const need = months.filter(m => level === 'full' ? C.state.get(m) !== 'full' : !C.state.has(m)).sort();
+  if (!need.length) return;
+  const rows = await S.store.entries(need[0], need.at(-1), level === 'light');
+  const set = new Set(need);
+  for (const [id, r] of C.rows) if (set.has(r.month)) C.rows.delete(id);
+  for (const r of rows) {
+    if (!set.has(r.month)) { if (C.state.has(r.month)) C.rows.set(r.id, { ...(C.rows.get(r.id) || {}), ...r }); continue; }
+    C.rows.set(r.id, r);
+  }
+  need.forEach(m => C.state.set(m, level));
+}
+function putRow(r) {
+  if (!r) return;
+  if (C.state.has(r.month)) C.rows.set(r.id, { ...(C.rows.get(r.id) || {}), ...r });
+  else C.rows.delete(r.id); // 다른 달(아직 안 불러온 달)로 옮겨진 경우
+}
+function derive() {
+  S.entries = rowsOf(S.month);
+  S.range = last6().flatMap(rowsOf);
+}
+
+/* ───────── 데이터 로드 ───────── */
+let lastLoad = 0;
+async function load({ force = false, cats = false } = {}) {
+  if (force) [S.month, addMonth(S.month, -1)].forEach(m => C.state.delete(m));
+  const meta = [];
+  if (cats || !S.cats.length) meta.push(S.store.categories().then(c => { S.cats = c; }));
+  if (!S.hh) meta.push(S.store.household().then(h => { S.hh = h; }), S.store.members().then(m => { S.members = m; }));
+  await Promise.all([...meta, ensure([S.month], 'full'), ensure([addMonth(S.month, -1)], 'light')]);
+  if (S.tab === 'trend') await ensure(last6(), 'light');
+  derive(); lastLoad = Date.now();
+}
+async function refresh(opts) { try { await load(opts); render(); } catch (e) { toast(e.message || '불러오기 실패'); } }
+let rt;
+const renderSoon = () => { clearTimeout(rt); rt = setTimeout(render, 150); };
+
+function onChange(p) {
+  if (p.table === 'categories') { clearTimeout(onChange.t); onChange.t = setTimeout(() => refresh({ cats: true }), 300); return; }
+  if (p.eventType === 'DELETE') { if (!C.rows.delete(p.old?.id)) return; }
+  else putRow(p.new);
+  derive(); renderSoon();
+}
+
+let unsub = null;
 async function start() {
-  await refresh();
+  await refresh({ cats: true });
   unsub?.();
-  unsub = S.store.subscribe(() => { clearTimeout(rt); rt = setTimeout(refresh, 300); });
-  document.addEventListener('visibilitychange', () => { if (!document.hidden) refresh(); });
+  unsub = S.store.subscribe(onChange);
+  // 앱으로 돌아왔을 때: 30초 넘게 지났으면 이번 달·지난달만 다시 확인 (놓친 변경 대비)
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden && Date.now() - lastLoad > 30000) refresh({ force: true, cats: true });
+  });
 }
 
 /* ───────── 렌더 ───────── */
@@ -562,14 +614,14 @@ function entrySheet(entry, presetCat) {
       const row = { category_id: cat, amount, memo: sh.querySelector('#memo').value.trim(), spent_on, month: spent_on ? spent_on.slice(0, 7) : (entry?.month || S.month) };
       ev.target.disabled = true;
       try {
-        isNew ? await S.store.addEntry(row) : await S.store.updateEntry(entry.id, row);
-        S.open.add(cat); closeSheet(); await refresh();
+        putRow(isNew ? await S.store.addEntry(row) : await S.store.updateEntry(entry.id, row));
+        S.open.add(cat); closeSheet(); derive(); render();
         if (row.month !== S.month) toast(`${monthLabel(row.month)}에 저장했어요`);
       } catch (e) { toast(e.message); ev.target.disabled = false; }
     };
     sh.querySelector('#del')?.addEventListener('click', async () => {
       if (!confirm('이 지출을 삭제할까요?')) return;
-      try { await S.store.deleteEntry(entry.id); closeSheet(); await refresh(); } catch (e) { toast(e.message); }
+      try { await S.store.deleteEntry(entry.id); C.rows.delete(entry.id); closeSheet(); derive(); render(); } catch (e) { toast(e.message); }
     });
   });
 }
@@ -597,18 +649,27 @@ function catSheet(c) {
       const name = sh.querySelector('#nm').value.trim();
       if (!name) { toast('이름을 입력하세요'); return; }
       const p = { name, color, is_fixed: sh.querySelector('#fx').checked };
-      try { isNew ? await S.store.addCategory(p) : await S.store.updateCategory(c.id, p); closeSheet(); await refresh(); } catch (e) { toast(e.message); }
+      try { isNew ? await S.store.addCategory(p) : await S.store.updateCategory(c.id, p); closeSheet(); await refresh({ cats: true }); } catch (e) { toast(e.message); }
     };
     sh.querySelector('#del')?.addEventListener('click', async () => {
       if (!confirm(`'${c.name}' 카테고리를 삭제할까요?\n이 카테고리의 모든 달 기록도 함께 삭제돼요.`)) return;
-      try { await S.store.deleteCategory(c.id); closeSheet(); await refresh(); } catch (e) { toast(e.message); }
+      try {
+        await S.store.deleteCategory(c.id);
+        for (const [id, r] of C.rows) if (r.category_id === c.id) C.rows.delete(id);
+        closeSheet(); await refresh({ cats: true });
+      } catch (e) { toast(e.message); }
     });
   });
 }
 
 /* ───────── 액션 ───────── */
 const ACT = {
-  tab: b => { S.tab = b.dataset.v; render(); window.scrollTo(0, 0); },
+  tab: async b => {
+    S.tab = b.dataset.v; window.scrollTo(0, 0);
+    if (S.tab === 'trend') return refresh(); // 추이 탭을 열 때만 6개월치 합계용 데이터 로드
+    if (S.tab === 'settings' && S.store.mode === 'cloud') S.store.members().then(m => { S.members = m; if (S.tab === 'settings') render(); }).catch(() => {});
+    render();
+  },
   prev: async () => { S.month = addMonth(S.month, -1); S.open.clear(); await refresh(); },
   next: async () => { S.month = addMonth(S.month, 1); S.open.clear(); await refresh(); },
   toggle: b => { const id = b.dataset.id; S.open.has(id) ? S.open.delete(id) : S.open.add(id); render(); },
@@ -620,20 +681,22 @@ const ACT = {
     const i = S.cats.findIndex(c => c.id === b.dataset.id), j = i + +b.dataset.d;
     if (j < 0 || j >= S.cats.length) return;
     const list = [...S.cats]; [list[i], list[j]] = [list[j], list[i]];
-    try { await Promise.all(list.map((c, k) => c.sort_order !== k ? S.store.updateCategory(c.id, { sort_order: k }) : null)); await refresh(); } catch (e) { toast(e.message); }
+    try { await Promise.all(list.map((c, k) => c.sort_order !== k ? S.store.updateCategory(c.id, { sort_order: k }) : null)); await refresh({ cats: true }); } catch (e) { toast(e.message); }
   },
   copyfixed: async () => {
     const fixedIds = new Set(S.cats.filter(c => c.is_fixed).map(c => c.id));
-    const prev = S.range.filter(e => e.month === addMonth(S.month, -1) && fixedIds.has(e.category_id));
     try {
-      for (const e of prev) await S.store.addEntry({ category_id: e.category_id, amount: e.amount, memo: e.memo, month: S.month, spent_on: null });
+      await ensure([addMonth(S.month, -1)], 'full'); // 메모까지 필요하니 지난달 전체 로드
+      const prev = rowsOf(addMonth(S.month, -1)).filter(e => fixedIds.has(e.category_id));
+      const added = await S.store.addEntries(prev.map(e => ({ category_id: e.category_id, amount: e.amount, memo: e.memo || '', month: S.month, spent_on: null })));
+      added.forEach(putRow);
       prev.forEach(e => S.open.add(e.category_id));
-      await refresh(); toast(`고정지출 ${prev.length}건을 불러왔어요`);
+      derive(); render(); toast(`고정지출 ${prev.length}건을 불러왔어요`);
     } catch (e) { toast(e.message); }
   },
   rename: async () => {
     const name = prompt('가계부 이름', S.hh?.name || ''); if (!name?.trim()) return;
-    try { await S.store.renameHousehold(name.trim()); await refresh(); } catch (e) { toast(e.message); }
+    try { await S.store.renameHousehold(name.trim()); S.hh = { ...S.hh, name: name.trim() }; render(); } catch (e) { toast(e.message); }
   },
   copycode: async () => { try { await navigator.clipboard.writeText(S.hh.invite_code); toast('초대코드를 복사했어요'); } catch (_) { toast(S.hh.invite_code); } },
   csv: async () => {
@@ -648,8 +711,8 @@ const ACT = {
       setTimeout(() => URL.revokeObjectURL(a.href), 2000);
     } catch (e) { toast(e.message); }
   },
-  reset: async () => { if (!confirm('데모 데이터를 모두 지우고 기본 카테고리만 남길까요?')) return; await S.store.reset(); S.open.clear(); await refresh(); toast('초기화했어요'); },
-  logout: async () => { if (!confirm('로그아웃할까요?')) return; unsub?.(); await S.sb.auth.signOut(); S.store = null; renderAuth(); },
+  reset: async () => { if (!confirm('데모 데이터를 모두 지우고 기본 카테고리만 남길까요?')) return; await S.store.reset(); S.open.clear(); C.rows.clear(); C.state.clear(); await refresh({ cats: true }); toast('초기화했어요'); },
+  logout: async () => { if (!confirm('로그아웃할까요?')) return; unsub?.(); await S.sb.auth.signOut(); S.store = null; S.hh = null; S.cats = []; C.rows.clear(); C.state.clear(); renderAuth(); },
 };
 document.addEventListener('click', e => {
   const b = e.target.closest('[data-act]'); if (!b || b.disabled) return;
